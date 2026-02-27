@@ -9,10 +9,12 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/health"
 	"github.com/Dicklesworthstone/ntm/internal/output"
 	"github.com/Dicklesworthstone/ntm/internal/swarm"
@@ -23,6 +25,7 @@ func newSwarmCmd() *cobra.Command {
 	var (
 		scanDir         string
 		projects        []string
+		types           []string
 		dryRun          bool
 		remote          string
 		jsonOutput      bool
@@ -54,6 +57,7 @@ Examples:
 			return runSwarm(cmd.Context(), swarmOptions{
 				ScanDir:         scanDir,
 				Projects:        projects,
+				Types:           types,
 				DryRun:          dryRun,
 				Remote:          remote,
 				JSONOutput:      jsonOutput,
@@ -83,6 +87,7 @@ Examples:
 
 	cmd.Flags().StringVar(&scanDir, "scan-dir", defaultScanDir, "Directory to scan for projects")
 	cmd.Flags().StringSliceVar(&projects, "projects", nil, "Explicit list of project paths (comma-separated)")
+	cmd.Flags().StringSliceVar(&types, "types", nil, "Agent types to include (comma-separated: cc,cod,gmi)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Preview plan without creating sessions")
 	cmd.Flags().StringVar(&remote, "remote", "", "Remote host for SSH execution (user@host)")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "Output plan as JSON")
@@ -104,6 +109,7 @@ Examples:
 type swarmOptions struct {
 	ScanDir         string
 	Projects        []string
+	Types           []string
 	DryRun          bool
 	Remote          string
 	JSONOutput      bool
@@ -159,6 +165,15 @@ func runSwarm(ctx context.Context, opts swarmOptions) error {
 		ctx = context.Background()
 	}
 	logger := slog.Default()
+
+	normalizedTypes, err := normalizeSwarmTypes(opts.Types)
+	if err != nil {
+		return fmt.Errorf("invalid --types: %w", err)
+	}
+	opts.Types = normalizedTypes
+	if len(opts.Types) > 0 {
+		logger.Info("agent types filter enabled", "types", opts.Types)
+	}
 
 	initialPrompt, promptSource, promptPath, err := resolveSwarmInitialPrompt(opts.InitialPrompt, opts.PromptFile)
 	if err != nil {
@@ -225,6 +240,7 @@ func runSwarm(ctx context.Context, opts swarmOptions) error {
 
 	// Calculate allocations
 	calc := swarm.NewAllocationCalculator(&swarmCfg)
+	calc.AllowedTypes = opts.Types
 	plan := calc.GenerateSwarmPlan(opts.ScanDir, projects)
 	logger.Info("calculated panes per session",
 		"sessions_per_type", plan.SessionsPerType,
@@ -277,10 +293,12 @@ func runSwarm(ctx context.Context, opts swarmOptions) error {
 
 	executor := &swarm.SwarmOrchestrator{
 		SessionOrchestrator: sessOrch,
-		PaneLauncher:        swarm.NewPaneLauncherWithClient(tmuxClient).WithLogger(logger),
-		PromptInjector:      swarm.NewPromptInjectorWithClient(tmuxClient).WithLogger(logger),
-		Logger:              logger,
-		StaggerDelay:        staggerDelay,
+		PaneLauncher: swarm.NewPaneLauncherWithClient(tmuxClient).
+			WithLogger(logger).
+			WithCmdBuilder(buildSwarmLaunchCommandBuilder(cfg, logger)),
+		PromptInjector: swarm.NewPromptInjectorWithClient(tmuxClient).WithLogger(logger),
+		Logger:         logger,
+		StaggerDelay:   staggerDelay,
 	}
 
 	execResult, err := executor.Execute(ctx, plan, initialPrompt)
@@ -316,6 +334,78 @@ func runSwarm(ctx context.Context, opts swarmOptions) error {
 	}
 
 	return nil
+}
+
+func buildSwarmLaunchCommandBuilder(cfg *config.Config, logger *slog.Logger) *swarm.LaunchCommandBuilder {
+	builder := swarm.NewLaunchCommandBuilder().WithFullPaths(true)
+	if logger != nil {
+		builder = builder.WithLogger(logger)
+	}
+	if cfg == nil {
+		return builder
+	}
+
+	vars := config.AgentTemplateVars{}
+	templates := map[string]string{
+		swarm.AgentCC:  strings.TrimSpace(cfg.Agents.Claude),
+		swarm.AgentCOD: strings.TrimSpace(cfg.Agents.Codex),
+		swarm.AgentGMI: strings.TrimSpace(cfg.Agents.Gemini),
+	}
+
+	for agentType, tmpl := range templates {
+		if tmpl == "" {
+			continue
+		}
+
+		rendered, err := config.GenerateAgentCommand(tmpl, vars)
+		if err != nil {
+			if logger != nil {
+				logger.Warn("failed to render swarm agent template",
+					"agent_type", agentType,
+					"error", err)
+			}
+			continue
+		}
+
+		if err := swarm.ApplyRenderedAgentCommand(builder, agentType, rendered); err != nil {
+			if logger != nil {
+				logger.Warn("failed to parse rendered swarm agent command",
+					"agent_type", agentType,
+					"error", err)
+			}
+			continue
+		}
+	}
+
+	return builder
+}
+
+func normalizeSwarmTypes(types []string) ([]string, error) {
+	if len(types) == 0 {
+		return nil, nil
+	}
+
+	out := make([]string, 0, len(types))
+	seen := make(map[string]struct{}, len(types))
+
+	for _, raw := range types {
+		for _, part := range strings.Split(raw, ",") {
+			agentType := strings.ToLower(strings.TrimSpace(part))
+			if agentType == "" {
+				return nil, fmt.Errorf("empty type is not allowed (valid types: cc,cod,gmi)")
+			}
+			if err := swarm.ValidateAgentType(agentType); err != nil {
+				return nil, err
+			}
+			if _, ok := seen[agentType]; ok {
+				continue
+			}
+			seen[agentType] = struct{}{}
+			out = append(out, agentType)
+		}
+	}
+
+	return out, nil
 }
 
 func resolveSwarmInitialPrompt(prompt, promptFile string) (resolved string, source string, path string, err error) {
@@ -460,8 +550,11 @@ func writePlanToFile(plan *swarm.SwarmPlan, path string) error {
 // Subcommand: swarm plan
 func newSwarmPlanCmd() *cobra.Command {
 	var (
-		scanDir  string
-		projects []string
+		scanDir         string
+		projects        []string
+		types           []string
+		sessionsPerType int
+		panesPerSession int
 	)
 
 	cmd := &cobra.Command{
@@ -473,11 +566,14 @@ func newSwarmPlanCmd() *cobra.Command {
 				return err
 			}
 			return runSwarm(cmd.Context(), swarmOptions{
-				ScanDir:    scanDir,
-				Projects:   projects,
-				DryRun:     true,
-				JSONOutput: jsonOutput,
-				AutoRotate: autoRotate,
+				ScanDir:         scanDir,
+				Projects:        projects,
+				Types:           types,
+				DryRun:          true,
+				JSONOutput:      jsonOutput,
+				AutoRotate:      autoRotate,
+				SessionsPerType: sessionsPerType,
+				PanesPerSession: panesPerSession,
 			})
 		},
 	}
@@ -486,9 +582,16 @@ func newSwarmPlanCmd() *cobra.Command {
 	if cfg != nil && cfg.Swarm.DefaultScanDir != "" {
 		defaultScanDir = cfg.Swarm.DefaultScanDir
 	}
+	defaultSessionsPerType := 3
+	if cfg != nil && cfg.Swarm.SessionsPerType > 0 {
+		defaultSessionsPerType = cfg.Swarm.SessionsPerType
+	}
 
 	cmd.Flags().StringVar(&scanDir, "scan-dir", defaultScanDir, "Directory to scan for projects")
 	cmd.Flags().StringSliceVar(&projects, "projects", nil, "Explicit list of project paths")
+	cmd.Flags().StringSliceVar(&types, "types", nil, "Agent types to include (comma-separated: cc,cod,gmi)")
+	cmd.Flags().IntVar(&sessionsPerType, "sessions-per-type", defaultSessionsPerType, "Number of tmux sessions per agent type (default: 3)")
+	cmd.Flags().IntVar(&panesPerSession, "panes-per-session", 0, "Max panes per session (0 = auto-calculate from total agents)")
 
 	return cmd
 }

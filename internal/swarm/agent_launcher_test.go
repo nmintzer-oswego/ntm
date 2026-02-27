@@ -615,7 +615,7 @@ func TestDefaultAgentArgs(t *testing.T) {
 		expectedArgs []string
 	}{
 		{"cc", []string{"--dangerously-skip-permissions"}},
-		{"cod", []string{"--quiet", "--auto-approve"}},
+		{"cod", []string{"--dangerously-bypass-approvals-and-sandbox"}},
 		{"gmi", []string{"--non-interactive"}},
 	}
 
@@ -738,9 +738,9 @@ func TestLaunchCommandToShellCommand(t *testing.T) {
 			name: "binary with multiple args",
 			cmd: LaunchCommand{
 				Binary: "codex",
-				Args:   []string{"--quiet", "--auto-approve"},
+				Args:   []string{"--dangerously-bypass-approvals-and-sandbox"},
 			},
-			expected: "codex --quiet --auto-approve",
+			expected: "codex --dangerously-bypass-approvals-and-sandbox",
 		},
 	}
 
@@ -793,14 +793,14 @@ func TestBuildLaunchCommand(t *testing.T) {
 			agentType:      "cod",
 			useFullPaths:   false,
 			expectedBinary: "cod",
-			expectedArgs:   []string{"--quiet", "--auto-approve"},
+			expectedArgs:   []string{"--dangerously-bypass-approvals-and-sandbox"},
 		},
 		{
 			name:           "cod with full path",
 			agentType:      "cod",
 			useFullPaths:   true,
 			expectedBinary: "codex",
-			expectedArgs:   []string{"--quiet", "--auto-approve"},
+			expectedArgs:   []string{"--dangerously-bypass-approvals-and-sandbox"},
 		},
 		{
 			name:           "gmi with shell alias",
@@ -922,6 +922,57 @@ func TestBuildLaunchCommandWithEnvVars(t *testing.T) {
 	}
 	if !envMap["DEBUG=true"] {
 		t.Error("expected DEBUG=true in Env")
+	}
+}
+
+func TestApplyRenderedAgentCommand(t *testing.T) {
+	builder := NewLaunchCommandBuilder().WithFullPaths(true)
+
+	rendered := `NODE_OPTIONS="--max-old-space-size=32768" claude --dangerously-skip-permissions --model 'claude opus'`
+	if err := ApplyRenderedAgentCommand(builder, "cc", rendered); err != nil {
+		t.Fatalf("ApplyRenderedAgentCommand returned error: %v", err)
+	}
+
+	cmd := builder.BuildLaunchCommand(PaneSpec{
+		Index:     1,
+		AgentType: "cc",
+	}, "/tmp")
+
+	if cmd.Binary != "claude" {
+		t.Fatalf("Binary = %q, want %q", cmd.Binary, "claude")
+	}
+
+	expectedArgs := []string{"--dangerously-skip-permissions", "--model", "claude opus"}
+	if len(cmd.Args) != len(expectedArgs) {
+		t.Fatalf("Args len = %d, want %d", len(cmd.Args), len(expectedArgs))
+	}
+	for i := range expectedArgs {
+		if cmd.Args[i] != expectedArgs[i] {
+			t.Errorf("Args[%d] = %q, want %q", i, cmd.Args[i], expectedArgs[i])
+		}
+	}
+
+	foundNodeOptions := false
+	for _, envVar := range cmd.Env {
+		if envVar == "NODE_OPTIONS=--max-old-space-size=32768" {
+			foundNodeOptions = true
+			break
+		}
+	}
+	if !foundNodeOptions {
+		t.Errorf("expected NODE_OPTIONS env var, got %v", cmd.Env)
+	}
+}
+
+func TestApplyRenderedAgentCommandError(t *testing.T) {
+	builder := NewLaunchCommandBuilder()
+
+	if err := ApplyRenderedAgentCommand(builder, "cc", ""); err == nil {
+		t.Fatal("expected error for empty command")
+	}
+
+	if err := ApplyRenderedAgentCommand(builder, "cc", `claude --model "unterminated`); err == nil {
+		t.Fatal("expected error for unterminated quote")
 	}
 }
 

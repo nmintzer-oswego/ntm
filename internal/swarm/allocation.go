@@ -3,6 +3,7 @@ package swarm
 import (
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
@@ -13,6 +14,9 @@ import (
 type AllocationCalculator struct {
 	// Config holds the swarm configuration with tier thresholds and allocations.
 	Config *config.SwarmConfig
+	// AllowedTypes optionally filters allocations/sessions to the given types.
+	// Empty means allow all types.
+	AllowedTypes []string
 }
 
 // NewAllocationCalculator creates a new AllocationCalculator with the given config.
@@ -56,6 +60,7 @@ func (ac *AllocationCalculator) CalculateAllocations(projects []ProjectBeadCount
 	if len(projects) == 0 {
 		return []ProjectAllocation{}
 	}
+	allowedTypes, hasTypeFilter := ac.allowedTypeSet()
 
 	// Sort projects by bead count descending
 	sorted := make([]ProjectBeadCount, len(projects))
@@ -66,7 +71,20 @@ func (ac *AllocationCalculator) CalculateAllocations(projects []ProjectBeadCount
 
 	allocations := make([]ProjectAllocation, len(sorted))
 	for i, project := range sorted {
-		allocations[i] = ac.CalculateProjectAllocation(project)
+		alloc := ac.CalculateProjectAllocation(project)
+		if hasTypeFilter {
+			if _, ok := allowedTypes[AgentCC]; !ok {
+				alloc.CCAgents = 0
+			}
+			if _, ok := allowedTypes[AgentCOD]; !ok {
+				alloc.CodAgents = 0
+			}
+			if _, ok := allowedTypes[AgentGMI]; !ok {
+				alloc.GmiAgents = 0
+			}
+			alloc.TotalAgents = alloc.CCAgents + alloc.CodAgents + alloc.GmiAgents
+		}
+		allocations[i] = alloc
 	}
 
 	return allocations
@@ -158,23 +176,52 @@ func (ac *AllocationCalculator) GenerateSwarmPlan(scanDir string, projects []Pro
 // generateSessions creates session specifications for all agent types.
 func (ac *AllocationCalculator) generateSessions(allocations []ProjectAllocation, sessionsPerType, panesPerSession int) []SessionSpec {
 	var sessions []SessionSpec
+	allowedTypes, hasTypeFilter := ac.allowedTypeSet()
 
 	// Generate CC sessions
-	ccSessions := ac.generateSessionsForType("cc", allocations, sessionsPerType, panesPerSession,
-		func(a ProjectAllocation) int { return a.CCAgents })
-	sessions = append(sessions, ccSessions...)
+	if !hasTypeFilter || containsType(allowedTypes, AgentCC) {
+		ccSessions := ac.generateSessionsForType(AgentCC, allocations, sessionsPerType, panesPerSession,
+			func(a ProjectAllocation) int { return a.CCAgents })
+		sessions = append(sessions, ccSessions...)
+	}
 
 	// Generate Codex sessions
-	codSessions := ac.generateSessionsForType("cod", allocations, sessionsPerType, panesPerSession,
-		func(a ProjectAllocation) int { return a.CodAgents })
-	sessions = append(sessions, codSessions...)
+	if !hasTypeFilter || containsType(allowedTypes, AgentCOD) {
+		codSessions := ac.generateSessionsForType(AgentCOD, allocations, sessionsPerType, panesPerSession,
+			func(a ProjectAllocation) int { return a.CodAgents })
+		sessions = append(sessions, codSessions...)
+	}
 
 	// Generate Gemini sessions
-	gmiSessions := ac.generateSessionsForType("gmi", allocations, sessionsPerType, panesPerSession,
-		func(a ProjectAllocation) int { return a.GmiAgents })
-	sessions = append(sessions, gmiSessions...)
+	if !hasTypeFilter || containsType(allowedTypes, AgentGMI) {
+		gmiSessions := ac.generateSessionsForType(AgentGMI, allocations, sessionsPerType, panesPerSession,
+			func(a ProjectAllocation) int { return a.GmiAgents })
+		sessions = append(sessions, gmiSessions...)
+	}
 
 	return sessions
+}
+
+func (ac *AllocationCalculator) allowedTypeSet() (map[string]struct{}, bool) {
+	if len(ac.AllowedTypes) == 0 {
+		return nil, false
+	}
+
+	allowedTypes := make(map[string]struct{}, len(ac.AllowedTypes))
+	for _, rawType := range ac.AllowedTypes {
+		agentType := strings.ToLower(strings.TrimSpace(rawType))
+		switch agentType {
+		case AgentCC, AgentCOD, AgentGMI:
+			allowedTypes[agentType] = struct{}{}
+		}
+	}
+
+	return allowedTypes, true
+}
+
+func containsType(allowedTypes map[string]struct{}, agentType string) bool {
+	_, ok := allowedTypes[agentType]
+	return ok
 }
 
 // generateSessionsForType creates sessions for a specific agent type.

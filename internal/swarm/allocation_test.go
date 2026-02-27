@@ -151,6 +151,36 @@ func TestAllocationCalculator_CalculateAllocations_Empty(t *testing.T) {
 	}
 }
 
+func TestAllocationCalculator_CalculateAllocations_FilterAllowedTypes(t *testing.T) {
+	cfg := testSwarmConfig()
+	ac := NewAllocationCalculator(cfg)
+	ac.AllowedTypes = []string{"cc", "cod"}
+
+	projects := []ProjectBeadCount{
+		{Path: "/dp/proj1", Name: "proj1", OpenBeads: 500}, // tier1: 4+4+2
+		{Path: "/dp/proj2", Name: "proj2", OpenBeads: 150}, // tier2: 3+3+2
+	}
+
+	allocations := ac.CalculateAllocations(projects)
+	if len(allocations) != 2 {
+		t.Fatalf("expected 2 allocations, got %d", len(allocations))
+	}
+
+	// Sorted by beads descending: proj1 (tier1) then proj2 (tier2)
+	if allocations[0].GmiAgents != 0 {
+		t.Errorf("tier1 GmiAgents = %d, want 0", allocations[0].GmiAgents)
+	}
+	if allocations[0].TotalAgents != 8 {
+		t.Errorf("tier1 TotalAgents = %d, want 8", allocations[0].TotalAgents)
+	}
+	if allocations[1].GmiAgents != 0 {
+		t.Errorf("tier2 GmiAgents = %d, want 0", allocations[1].GmiAgents)
+	}
+	if allocations[1].TotalAgents != 6 {
+		t.Errorf("tier2 TotalAgents = %d, want 6", allocations[1].TotalAgents)
+	}
+}
+
 func TestAllocationCalculator_CalculateTotals(t *testing.T) {
 	cfg := testSwarmConfig()
 	ac := NewAllocationCalculator(cfg)
@@ -315,6 +345,56 @@ func TestAllocationCalculator_GenerateSwarmPlan_Empty(t *testing.T) {
 
 	if len(plan.Sessions) != 0 {
 		t.Errorf("expected no sessions, got %d", len(plan.Sessions))
+	}
+}
+
+func TestAllocationCalculator_GenerateSwarmPlan_FilterAllowedTypes(t *testing.T) {
+	cfg := testSwarmConfig()
+	ac := NewAllocationCalculator(cfg)
+	ac.AllowedTypes = []string{"cc"}
+
+	projects := []ProjectBeadCount{
+		{Path: "/dp/proj1", Name: "proj1", OpenBeads: 500}, // tier1: 4+4+2
+		{Path: "/dp/proj2", Name: "proj2", OpenBeads: 150}, // tier2: 3+3+2
+	}
+
+	plan := ac.GenerateSwarmPlan("/dp", projects)
+	if plan == nil {
+		t.Fatal("expected non-nil SwarmPlan")
+	}
+
+	if plan.TotalCC != 7 {
+		t.Errorf("TotalCC = %d, want 7", plan.TotalCC)
+	}
+	if plan.TotalCod != 0 {
+		t.Errorf("TotalCod = %d, want 0", plan.TotalCod)
+	}
+	if plan.TotalGmi != 0 {
+		t.Errorf("TotalGmi = %d, want 0", plan.TotalGmi)
+	}
+	if plan.TotalAgents != 7 {
+		t.Errorf("TotalAgents = %d, want 7", plan.TotalAgents)
+	}
+
+	for _, alloc := range plan.Allocations {
+		if alloc.CodAgents != 0 {
+			t.Errorf("allocation CodAgents = %d, want 0", alloc.CodAgents)
+		}
+		if alloc.GmiAgents != 0 {
+			t.Errorf("allocation GmiAgents = %d, want 0", alloc.GmiAgents)
+		}
+	}
+
+	if len(plan.Sessions) == 0 {
+		t.Fatal("expected at least one CC session")
+	}
+	for _, session := range plan.Sessions {
+		if session.AgentType != "cc" {
+			t.Errorf("session AgentType = %q, want cc", session.AgentType)
+		}
+		if len(session.Name) < 10 || session.Name[:10] != "cc_agents_" {
+			t.Errorf("session Name = %q, want prefix cc_agents_", session.Name)
+		}
 	}
 }
 

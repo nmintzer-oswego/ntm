@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
@@ -420,8 +421,151 @@ var DefaultAgentCommands = map[string]string{
 // DefaultAgentArgs provides default arguments per agent type.
 var DefaultAgentArgs = map[string][]string{
 	"cc":  {"--dangerously-skip-permissions"},
-	"cod": {"--quiet", "--auto-approve"},
+	"cod": {"--dangerously-bypass-approvals-and-sandbox"},
 	"gmi": {"--non-interactive"},
+}
+
+// ApplyRenderedAgentCommand parses a rendered command and applies it to the
+// launch command builder for the provided agent type.
+//
+// The command supports:
+// - leading environment assignments (KEY=value)
+// - shell-style quoting for arguments
+func ApplyRenderedAgentCommand(builder *LaunchCommandBuilder, agentType, renderedCommand string) error {
+	if builder == nil {
+		return fmt.Errorf("builder cannot be nil")
+	}
+
+	tokens, err := splitShellCommand(renderedCommand)
+	if err != nil {
+		return fmt.Errorf("parse command for %s: %w", agentType, err)
+	}
+	if len(tokens) == 0 {
+		return fmt.Errorf("command for %s is empty", agentType)
+	}
+
+	env := map[string]string{}
+	idx := 0
+	for idx < len(tokens) {
+		key, value, ok := parseEnvAssignment(tokens[idx])
+		if !ok {
+			break
+		}
+		env[key] = value
+		idx++
+	}
+	if idx >= len(tokens) {
+		return fmt.Errorf("command for %s has env assignments but no executable", agentType)
+	}
+
+	builder.WithAgentPath(agentType, tokens[idx])
+	builder.WithAgentArgs(agentType, append([]string(nil), tokens[idx+1:]...))
+	if len(env) > 0 {
+		builder.WithEnvVars(agentType, env)
+	}
+
+	return nil
+}
+
+func splitShellCommand(command string) ([]string, error) {
+	var tokens []string
+	var token strings.Builder
+
+	inSingle := false
+	inDouble := false
+	escaped := false
+	tokenStarted := false
+
+	flush := func() {
+		if !tokenStarted {
+			return
+		}
+		tokens = append(tokens, token.String())
+		token.Reset()
+		tokenStarted = false
+	}
+
+	for _, r := range command {
+		if escaped {
+			token.WriteRune(r)
+			tokenStarted = true
+			escaped = false
+			continue
+		}
+
+		if inSingle {
+			if r == '\'' {
+				inSingle = false
+				continue
+			}
+			token.WriteRune(r)
+			tokenStarted = true
+			continue
+		}
+
+		if inDouble {
+			if r == '"' {
+				inDouble = false
+				continue
+			}
+			if r == '\\' {
+				escaped = true
+				tokenStarted = true
+				continue
+			}
+			token.WriteRune(r)
+			tokenStarted = true
+			continue
+		}
+
+		switch r {
+		case '\'':
+			inSingle = true
+			tokenStarted = true
+		case '"':
+			inDouble = true
+			tokenStarted = true
+		case '\\':
+			escaped = true
+			tokenStarted = true
+		case ' ', '\t', '\n', '\r':
+			flush()
+		default:
+			token.WriteRune(r)
+			tokenStarted = true
+		}
+	}
+
+	if escaped {
+		return nil, fmt.Errorf("unterminated escape sequence")
+	}
+	if inSingle || inDouble {
+		return nil, fmt.Errorf("unterminated quoted string")
+	}
+
+	flush()
+	return tokens, nil
+}
+
+func parseEnvAssignment(token string) (key, value string, ok bool) {
+	key, value, ok = strings.Cut(token, "=")
+	if !ok || key == "" {
+		return "", "", false
+	}
+
+	for i, r := range key {
+		if i == 0 {
+			if r != '_' && !unicode.IsLetter(r) {
+				return "", "", false
+			}
+			continue
+		}
+		if r != '_' && !unicode.IsLetter(r) && !unicode.IsDigit(r) {
+			return "", "", false
+		}
+	}
+
+	return key, value, true
 }
 
 // LaunchCommand represents a complete agent launch specification.

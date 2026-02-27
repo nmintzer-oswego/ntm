@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -98,6 +100,46 @@ func TestSwarmCmd_PromptFlagsExist(t *testing.T) {
 	}
 }
 
+func TestSwarmCmd_TypesFlagsExist(t *testing.T) {
+	cmd := newSwarmCmd()
+	if cmd.Flags().Lookup("types") == nil {
+		t.Fatal("expected --types flag to exist on swarm command")
+	}
+
+	for _, sub := range cmd.Commands() {
+		if sub.Name() == "plan" {
+			if sub.Flags().Lookup("types") == nil {
+				t.Fatal("expected --types flag to exist on swarm plan command")
+			}
+			return
+		}
+	}
+
+	t.Fatal("expected plan subcommand to exist")
+}
+
+func TestNormalizeSwarmTypes(t *testing.T) {
+	got, err := normalizeSwarmTypes([]string{"CC,cod", " gmi ", "cc"})
+	if err != nil {
+		t.Fatalf("normalizeSwarmTypes() error: %v", err)
+	}
+
+	want := []string{"cc", "cod", "gmi"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalizeSwarmTypes() = %v, want %v", got, want)
+	}
+}
+
+func TestNormalizeSwarmTypes_Invalid(t *testing.T) {
+	_, err := normalizeSwarmTypes([]string{"cc", "invalid"})
+	if err == nil {
+		t.Fatal("expected error for invalid type, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid agent type") {
+		t.Fatalf("expected invalid type error, got: %v", err)
+	}
+}
+
 func TestResolveSwarmInitialPrompt_MutuallyExclusive(t *testing.T) {
 	_, _, _, err := resolveSwarmInitialPrompt("hi", "/tmp/prompt.txt")
 	if err == nil {
@@ -147,6 +189,120 @@ func TestResolveSwarmInitialPrompt_PromptFileReadError(t *testing.T) {
 	_, _, _, err := resolveSwarmInitialPrompt("", "/definitely/does/not/exist.txt")
 	if err == nil {
 		t.Fatal("expected error for missing prompt file, got nil")
+	}
+}
+
+func TestBuildSwarmLaunchCommandBuilder_DefaultFallback(t *testing.T) {
+	builder := buildSwarmLaunchCommandBuilder(nil, nil)
+	if builder == nil {
+		t.Fatal("expected non-nil builder")
+	}
+	if !builder.UseFullPaths {
+		t.Fatal("expected UseFullPaths=true for swarm launch builder")
+	}
+
+	cmd := builder.BuildLaunchCommand(swarm.PaneSpec{
+		Index:     1,
+		AgentType: swarm.AgentCOD,
+	}, "/tmp")
+
+	if cmd.Binary != "codex" {
+		t.Fatalf("Binary = %q, want %q", cmd.Binary, "codex")
+	}
+	if len(cmd.Args) != 1 || cmd.Args[0] != "--dangerously-bypass-approvals-and-sandbox" {
+		t.Fatalf("Args = %v, want [--dangerously-bypass-approvals-and-sandbox]", cmd.Args)
+	}
+}
+
+func TestBuildSwarmLaunchCommandBuilder_FromConfigTemplates(t *testing.T) {
+	cfg := &config.Config{
+		Agents: config.AgentConfig{
+			Claude: `NODE_OPTIONS="--max-old-space-size=32768" claude --dangerously-skip-permissions`,
+			Codex:  `codex --dangerously-bypass-approvals-and-sandbox -m {{shellQuote (.Model | default "gpt-5.3-codex")}}`,
+			Gemini: `gemini --non-interactive --model {{shellQuote (.Model | default "gemini-2.5-pro")}}`,
+		},
+	}
+
+	builder := buildSwarmLaunchCommandBuilder(cfg, nil)
+
+	claudeCmd := builder.BuildLaunchCommand(swarm.PaneSpec{
+		Index:     1,
+		AgentType: swarm.AgentCC,
+	}, "/tmp")
+	if claudeCmd.Binary != "claude" {
+		t.Fatalf("Claude binary = %q, want %q", claudeCmd.Binary, "claude")
+	}
+	if len(claudeCmd.Args) != 1 || claudeCmd.Args[0] != "--dangerously-skip-permissions" {
+		t.Fatalf("Claude args = %v", claudeCmd.Args)
+	}
+	foundNodeOptions := false
+	for _, envVar := range claudeCmd.Env {
+		if envVar == "NODE_OPTIONS=--max-old-space-size=32768" {
+			foundNodeOptions = true
+			break
+		}
+	}
+	if !foundNodeOptions {
+		t.Fatalf("expected NODE_OPTIONS env var, got %v", claudeCmd.Env)
+	}
+
+	codexCmd := builder.BuildLaunchCommand(swarm.PaneSpec{
+		Index:     2,
+		AgentType: swarm.AgentCOD,
+	}, "/tmp")
+	if codexCmd.Binary != "codex" {
+		t.Fatalf("Codex binary = %q, want %q", codexCmd.Binary, "codex")
+	}
+	expectedCodexArgs := []string{
+		"--dangerously-bypass-approvals-and-sandbox",
+		"-m",
+		"gpt-5.3-codex",
+	}
+	if len(codexCmd.Args) != len(expectedCodexArgs) {
+		t.Fatalf("Codex args len = %d, want %d (%v)", len(codexCmd.Args), len(expectedCodexArgs), codexCmd.Args)
+	}
+	for i := range expectedCodexArgs {
+		if codexCmd.Args[i] != expectedCodexArgs[i] {
+			t.Fatalf("Codex args[%d] = %q, want %q", i, codexCmd.Args[i], expectedCodexArgs[i])
+		}
+	}
+
+	geminiCmd := builder.BuildLaunchCommand(swarm.PaneSpec{
+		Index:     3,
+		AgentType: swarm.AgentGMI,
+	}, "/tmp")
+	if geminiCmd.Binary != "gemini" {
+		t.Fatalf("Gemini binary = %q, want %q", geminiCmd.Binary, "gemini")
+	}
+	expectedGeminiArgs := []string{"--non-interactive", "--model", "gemini-2.5-pro"}
+	if len(geminiCmd.Args) != len(expectedGeminiArgs) {
+		t.Fatalf("Gemini args len = %d, want %d (%v)", len(geminiCmd.Args), len(expectedGeminiArgs), geminiCmd.Args)
+	}
+	for i := range expectedGeminiArgs {
+		if geminiCmd.Args[i] != expectedGeminiArgs[i] {
+			t.Fatalf("Gemini args[%d] = %q, want %q", i, geminiCmd.Args[i], expectedGeminiArgs[i])
+		}
+	}
+}
+
+func TestBuildSwarmLaunchCommandBuilder_TemplateErrorFallsBackToDefaults(t *testing.T) {
+	cfg := &config.Config{
+		Agents: config.AgentConfig{
+			Codex: "{{if .Model}}",
+		},
+	}
+
+	builder := buildSwarmLaunchCommandBuilder(cfg, nil)
+	cmd := builder.BuildLaunchCommand(swarm.PaneSpec{
+		Index:     1,
+		AgentType: swarm.AgentCOD,
+	}, "/tmp")
+
+	if cmd.Binary != "codex" {
+		t.Fatalf("Binary = %q, want %q", cmd.Binary, "codex")
+	}
+	if len(cmd.Args) != 1 || cmd.Args[0] != "--dangerously-bypass-approvals-and-sandbox" {
+		t.Fatalf("Args = %v, want [--dangerously-bypass-approvals-and-sandbox]", cmd.Args)
 	}
 }
 

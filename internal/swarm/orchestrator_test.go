@@ -706,3 +706,65 @@ func TestRemoteConnectionInfo_Failed(t *testing.T) {
 		t.Error("expected non-empty Error for failed connection")
 	}
 }
+
+func TestSwarmOrchestrator_WaitForAgentsReady_NilPlan(t *testing.T) {
+	orch := NewSwarmOrchestrator()
+	_, err := orch.WaitForAgentsReady(context.Background(), nil, 5*time.Second)
+	if err == nil {
+		t.Error("expected error for nil plan")
+	}
+}
+
+func TestSwarmOrchestrator_WaitForAgentsReady_Timeout(t *testing.T) {
+	// With no tmux sessions, WaitForAgentsReady should timeout
+	orch := NewSwarmOrchestrator()
+	plan := &SwarmPlan{
+		Sessions: []SessionSpec{
+			{Name: "nonexistent_session_1", AgentType: "cc", PaneCount: 1,
+				Panes: []PaneSpec{{Index: 1, AgentType: "cc"}}},
+		},
+	}
+
+	ctx := context.Background()
+	result, err := orch.WaitForAgentsReady(ctx, plan, 500*time.Millisecond)
+
+	if err == nil {
+		t.Error("expected timeout error")
+	}
+
+	if result == nil {
+		t.Fatal("expected non-nil result even on timeout")
+	}
+
+	if result.TotalAgents == 0 {
+		t.Error("expected at least 1 agent tracked")
+	}
+
+	if result.ReadyCount != 0 {
+		t.Errorf("expected 0 ready agents on timeout, got %d", result.ReadyCount)
+	}
+}
+
+func TestSwarmOrchestrator_WaitForAgentsReady_EmptyPlan(t *testing.T) {
+	orch := NewSwarmOrchestrator()
+	plan := &SwarmPlan{Sessions: []SessionSpec{}}
+
+	result, err := orch.WaitForAgentsReady(context.Background(), plan, 1*time.Second)
+
+	// Empty plan = 0 agents = all ready immediately
+	if err != nil {
+		t.Errorf("unexpected error for empty plan: %v", err)
+	}
+
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+
+	if result.TotalAgents != 0 {
+		t.Errorf("expected 0 agents, got %d", result.TotalAgents)
+	}
+
+	if result.ReadyCount != 0 {
+		t.Errorf("expected 0 ready, got %d", result.ReadyCount)
+	}
+}

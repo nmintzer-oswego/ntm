@@ -35,6 +35,8 @@ func newSwarmCmd() *cobra.Command {
 		autoRotate      bool
 		initialPrompt   string
 		promptFile      string
+		waitReady       bool
+		readyTimeout    time.Duration
 	)
 
 	cmd := &cobra.Command{
@@ -67,6 +69,8 @@ Examples:
 				AutoRotate:      autoRotate,
 				InitialPrompt:   initialPrompt,
 				PromptFile:      promptFile,
+				WaitReady:       waitReady,
+				ReadyTimeout:    readyTimeout,
 			})
 		},
 	}
@@ -96,6 +100,8 @@ Examples:
 	cmd.Flags().StringVar(&outputPath, "output", "", "Write swarm plan to JSON file (optional)")
 	cmd.Flags().StringVar(&initialPrompt, "prompt", "", "Initial prompt to inject into all agents after launch")
 	cmd.Flags().StringVar(&promptFile, "prompt-file", "", "File containing initial prompt (mutually exclusive with --prompt)")
+	cmd.Flags().BoolVar(&waitReady, "wait-ready", false, "Wait for all agents to show ready/idle state before returning. Recommended for automation")
+	cmd.Flags().DurationVar(&readyTimeout, "ready-timeout", 60*time.Second, "Max wait for agents to reach ready state (use with --wait-ready)")
 	cmd.PersistentFlags().BoolVar(&autoRotate, "auto-rotate-accounts", defaultAutoRotate, "Automatically rotate accounts on usage limit hit (requires caam)")
 
 	// Add subcommands
@@ -119,6 +125,8 @@ type swarmOptions struct {
 	AutoRotate      bool
 	InitialPrompt   string
 	PromptFile      string
+	WaitReady       bool
+	ReadyTimeout    time.Duration
 }
 
 // SwarmPlanOutput is the JSON output format for swarm plan
@@ -304,6 +312,25 @@ func runSwarm(ctx context.Context, opts swarmOptions) error {
 	execResult, err := executor.Execute(ctx, plan, initialPrompt)
 	if err != nil {
 		return err
+	}
+
+	// Phase 2.5: Wait for agents to reach ready state (optional)
+	if opts.WaitReady {
+		timeout := opts.ReadyTimeout
+		if timeout <= 0 {
+			timeout = 60 * time.Second
+		}
+		output.PrintInfof("Waiting for agents to reach ready state (timeout: %s)...", timeout)
+
+		waitResult, waitErr := executor.WaitForAgentsReady(ctx, plan, timeout)
+		if waitErr != nil {
+			output.PrintWarningf("Ready wait: %v", waitErr)
+		}
+		if waitResult != nil {
+			output.PrintSuccessf("Agents ready: %d/%d (took %s)",
+				waitResult.ReadyCount, waitResult.TotalAgents,
+				waitResult.Duration.Round(time.Millisecond))
+		}
 	}
 
 	// Report results

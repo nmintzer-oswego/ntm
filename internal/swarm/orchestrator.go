@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/status"
 	"github.com/Dicklesworthstone/ntm/internal/tmux"
 )
 
@@ -756,6 +757,133 @@ func (o *SwarmOrchestrator) Execute(ctx context.Context, plan *SwarmPlan, prompt
 		"errors", result.ErrorCount)
 
 	return result, nil
+}
+
+// AgentReadyStatus tracks the readiness state of a single agent pane.
+type AgentReadyStatus struct {
+	SessionPane string `json:"session_pane"`
+	AgentType   string `json:"agent_type"`
+	Ready       bool   `json:"ready"`
+}
+
+// WaitReadyResult contains the result of waiting for agents to become ready.
+type WaitReadyResult struct {
+	TotalAgents int                `json:"total_agents"`
+	ReadyCount  int                `json:"ready_count"`
+	Duration    time.Duration      `json:"duration"`
+	Agents      []AgentReadyStatus `json:"agents"`
+}
+
+// WaitForAgentsReady polls all agent panes in the plan until they show idle/ready
+// state or the context deadline is reached. This prevents race conditions when
+// sending prompts via --robot-send immediately after swarm launch.
+func (o *SwarmOrchestrator) WaitForAgentsReady(ctx context.Context, plan *SwarmPlan, timeout time.Duration) (*WaitReadyResult, error) {
+	if plan == nil {
+		return nil, fmt.Errorf("plan cannot be nil")
+	}
+
+	logger := o.logger()
+	start := time.Now()
+
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	// Resolve the tmux client
+	var client *tmux.Client
+	if so, ok := o.SessionOrchestrator.(*SessionOrchestrator); ok && so.TmuxClient != nil {
+		client = so.TmuxClient
+	} else {
+		client = tmux.DefaultClient
+	}
+
+	// Build list of agent panes to monitor
+	var agents []AgentReadyStatus
+	for _, sess := range plan.Sessions {
+		panes, err := client.GetPanes(sess.Name)
+		if err != nil {
+			logger.Warn("[SwarmOrchestrator] wait_ready_get_panes_failed",
+				"session", sess.Name, "error", err)
+			// Add from plan as fallback
+			for _, p := range sess.Panes {
+				agents = append(agents, AgentReadyStatus{
+					SessionPane: fmt.Sprintf("%s:1.%d", sess.Name, p.Index),
+					AgentType:   p.AgentType,
+				})
+			}
+			continue
+		}
+		for _, pane := range panes {
+			if pane.Type == tmux.AgentUser {
+				continue
+			}
+			agents = append(agents, AgentReadyStatus{
+				SessionPane: pane.ID,
+				AgentType:   string(pane.Type),
+			})
+		}
+	}
+
+	logger.Info("[SwarmOrchestrator] wait_ready_start",
+		"total_agents", len(agents),
+		"timeout", timeout)
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		readyCount := 0
+		for i := range agents {
+			if agents[i].Ready {
+				readyCount++
+				continue
+			}
+
+			output, err := client.CaptureForStatusDetectionContext(ctx, agents[i].SessionPane)
+			if err != nil {
+				continue
+			}
+
+			if status.DetectIdleFromOutput(output, agents[i].AgentType) {
+				agents[i].Ready = true
+				readyCount++
+				logger.Info("[SwarmOrchestrator] agent_ready",
+					"session_pane", agents[i].SessionPane,
+					"agent_type", agents[i].AgentType)
+			}
+		}
+
+		if readyCount == len(agents) {
+			result := &WaitReadyResult{
+				TotalAgents: len(agents),
+				ReadyCount:  readyCount,
+				Duration:    time.Since(start),
+				Agents:      agents,
+			}
+			logger.Info("[SwarmOrchestrator] wait_ready_complete",
+				"ready", readyCount, "total", len(agents),
+				"duration", result.Duration)
+			return result, nil
+		}
+
+		select {
+		case <-ctx.Done():
+			result := &WaitReadyResult{
+				TotalAgents: len(agents),
+				ReadyCount:  readyCount,
+				Duration:    time.Since(start),
+				Agents:      agents,
+			}
+			logger.Warn("[SwarmOrchestrator] wait_ready_timeout",
+				"ready", readyCount, "total", len(agents),
+				"duration", result.Duration)
+			return result, fmt.Errorf("timeout waiting for agents: %d/%d ready after %v",
+				readyCount, len(agents), result.Duration)
+		case <-ticker.C:
+		}
+	}
 }
 
 // ShutdownConfig configures graceful shutdown behavior.
